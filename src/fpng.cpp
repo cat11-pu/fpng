@@ -1160,10 +1160,78 @@ do { \
 		return dst_ofs;
 	}
 
+	// Optimized one-pass encoder support.
+	//
+	// The original per-symbol Huffman lookups (separate code/size struct fields,
+	// several dependent loads per pixel) are replaced with:
+	//  1. Parallel code/size tables: each literal resolves with compact,
+	//     independent indexed loads instead of a wider struct fetch.
+	//  2. A match-length descriptor table: for every possible adjusted match
+	//     length it precomputes the Huffman code/length and the extra-bits value
+	//     (including the implicit 1-bit distance code), removing three dependent
+	//     table lookups and the g_bitmasks indirection on each match.
+	//  3. One flush per emitted group (a pixel's literals or one match) rather
+	//     than per individual symbol. A flush drains the same whole bytes the
+	//     original per-symbol flush would, leaving 0..7 bits pending, so every
+	//     emitted bit sequence is unchanged and the output stays byte-for-byte
+	//     identical to the original implementation.
+	struct packed_match_sym
+	{
+		uint32_t m_huff_code;      // Huffman code, pre-shifted by 0 (placed at current bit position)
+		uint32_t m_huff_code_size; // its length in bits
+		uint32_t m_extra_bits;     // extra length bits + the single implicit distance bit
+		uint32_t m_extra_value;    // adjusted length masked to the extra-bits width;
+		                           // the implicit distance 0-bit is appended by the
+		                           // extra-bits count including that one bit
+	};
+
+	static packed_match_sym g_packed_match_3[256];
+	static packed_match_sym g_packed_match_4[256];
+	// Parallel code/size arrays: tighter footprint than the 4-byte struct and
+	// lets the emitter use independent indexed loads.
+	static uint16_t g_huff_code_3[288], g_huff_code_4[288];
+	static uint8_t g_huff_size_3[288], g_huff_size_4[288];
+	static bool g_packed_tables_initialized = false;
+
+	static void init_packed_huff_tables()
+	{
+		if (g_packed_tables_initialized)
+			return;
+
+		for (uint32_t i = 0; i < 288; i++)
+		{
+			g_huff_code_3[i] = g_dyn_huff_3_codes[i].m_code;
+			g_huff_size_3[i] = g_dyn_huff_3_codes[i].m_code_size;
+			g_huff_code_4[i] = g_dyn_huff_4_codes[i].m_code;
+			g_huff_size_4[i] = g_dyn_huff_4_codes[i].m_code_size;
+		}
+
+		for (uint32_t adj = 0; adj < 256; adj++)
+		{
+			const uint32_t len_sym_3 = g_defl_len_sym[adj];
+			g_packed_match_3[adj].m_huff_code = g_dyn_huff_3_codes[len_sym_3].m_code;
+			g_packed_match_3[adj].m_huff_code_size = g_dyn_huff_3_codes[len_sym_3].m_code_size;
+			const uint32_t extra_3 = g_defl_len_extra[adj] + 1;
+			g_packed_match_3[adj].m_extra_bits = extra_3;
+			g_packed_match_3[adj].m_extra_value = adj & g_bitmasks[g_defl_len_extra[adj]];
+
+			const uint32_t len_sym_4 = g_defl_len_sym[adj];
+			g_packed_match_4[adj].m_huff_code = g_dyn_huff_4_codes[len_sym_4].m_code;
+			g_packed_match_4[adj].m_huff_code_size = g_dyn_huff_4_codes[len_sym_4].m_code_size;
+			const uint32_t extra_4 = g_defl_len_extra[adj] + 1;
+			g_packed_match_4[adj].m_extra_bits = extra_4;
+			g_packed_match_4[adj].m_extra_value = adj & g_bitmasks[g_defl_len_extra[adj]];
+		}
+
+		g_packed_tables_initialized = true;
+	}
+
 	static uint32_t pixel_deflate_dyn_3_rle_one_pass(
 		const uint8_t* pImg, uint32_t w, uint32_t h,
-		uint8_t* pDst, uint32_t dst_buf_size)
+		uint8_t* pDst, uint32_t dst_buf_size, uint32_t legacy_capacity)
 	{
+		init_packed_huff_tables();
+
 		const uint32_t bpl = 1 + w * 3;
 
 		if (dst_buf_size < sizeof(g_dyn_huff_3))
@@ -1179,28 +1247,78 @@ do { \
 
 		uint32_t src_adler32 = fpng_adler32(pImg, bpl * h, FPNG_ADLER32_INIT);
 
+		// Parallel code/size tables keep the hot literal data compact.
+		const uint16_t* __restrict huff_code = g_huff_code_3;
+		const uint8_t* __restrict huff_size = g_huff_size_3;
+		const packed_match_sym* __restrict match_tbl = g_packed_match_3;
+
+		// One flush per emitted group. It drains the same whole bytes that the
+		// original per-symbol flush would, leaving 0..7 bits pending, so the
+		// emitted bit sequence is identical while issuing fewer stores.
+#define EMIT_SYM_3(sym) do { \
+	bit_buf |= ((uint64_t)(huff_code[sym]) << bit_buf_size); \
+	bit_buf_size += huff_size[sym]; \
+} while(0)
+
+		// Build the three literal codes with independent shifts first, then
+		// merge them into the bit buffer with a single dependent shift/or.
+#define EMIT_RGB_LITERALS(lits) do { \
+	const uint32_t r_ = (lits) & 0xFF, g_ = ((lits) >> 8) & 0xFF, b_ = (lits) >> 16; \
+	const uint32_t rs_ = huff_size[r_], gs_ = huff_size[g_]; \
+	const uint64_t combined_ = (uint64_t)huff_code[r_] \
+		| ((uint64_t)huff_code[g_] << rs_) \
+		| ((uint64_t)huff_code[b_] << (rs_ + gs_)); \
+	bit_buf |= combined_ << bit_buf_size; \
+	bit_buf_size += rs_ + gs_ + huff_size[b_]; \
+} while(0)
+
+#define EMIT_MATCH_3(adj) do { \
+	const packed_match_sym& ms = match_tbl[adj]; \
+	bit_buf |= ((uint64_t)(ms.m_huff_code) << bit_buf_size); \
+	bit_buf_size += ms.m_huff_code_size; \
+	bit_buf |= ((uint64_t)(ms.m_extra_value) << bit_buf_size); \
+	bit_buf_size += ms.m_extra_bits; \
+} while(0)
+
+#define GUARANTEE_FLUSH() do { \
+	if ((dst_ofs + 8) > legacy_capacity) return 0; \
+	WRITE_LE64(pDst + dst_ofs, bit_buf); \
+	uint32_t bits_to_shift = bit_buf_size & ~7; \
+	dst_ofs += (bits_to_shift >> 3); \
+	bit_buf >>= bits_to_shift; \
+	bit_buf_size -= bits_to_shift; \
+} while(0)
+
+		// Drain the trailing partial byte(s).
+#define FINAL_FLUSH_3() do { \
+	while (bit_buf_size > 0) { \
+		pDst[dst_ofs++] = (uint8_t)bit_buf; \
+		bit_buf >>= 8; \
+		bit_buf_size -= 8; \
+	} \
+} while(0)
+
 		for (uint32_t y = 0; y < h; y++)
 		{
 			const uint32_t end_src_ofs = src_ofs + bpl;
 
 			const uint32_t filter_lit = pSrc[src_ofs++];
-			PUT_BITS_CZ(g_dyn_huff_3_codes[filter_lit].m_code, g_dyn_huff_3_codes[filter_lit].m_code_size);
+			GUARANTEE_FLUSH();
+			EMIT_SYM_3(filter_lit);
 
 			uint32_t prev_lits;
 
 			{
+				// First pixel of each row is always emitted as literals.
 				uint32_t lits = READ_RGB_PIXEL(pSrc + src_ofs);
 
-				PUT_BITS_CZ(g_dyn_huff_3_codes[lits & 0xFF].m_code, g_dyn_huff_3_codes[lits & 0xFF].m_code_size);
-				PUT_BITS_CZ(g_dyn_huff_3_codes[(lits >> 8) & 0xFF].m_code, g_dyn_huff_3_codes[(lits >> 8) & 0xFF].m_code_size);
-				PUT_BITS_CZ(g_dyn_huff_3_codes[(lits >> 16)].m_code, g_dyn_huff_3_codes[(lits >> 16)].m_code_size);
+				GUARANTEE_FLUSH();
+				EMIT_RGB_LITERALS(lits);
 
 				src_ofs += 3;
 			
 				prev_lits = lits;
 			}
-
-			PUT_BITS_FLUSH;
 
 			while (src_ofs < end_src_ofs)
 			{
@@ -1220,40 +1338,44 @@ do { \
 										
 					uint32_t adj_match_len = match_len - 3;
 
-					PUT_BITS_CZ(g_dyn_huff_3_codes[g_defl_len_sym[adj_match_len]].m_code, g_dyn_huff_3_codes[g_defl_len_sym[adj_match_len]].m_code_size);
-					PUT_BITS(adj_match_len & g_bitmasks[g_defl_len_extra[adj_match_len]], g_defl_len_extra[adj_match_len] + 1); // up to 6 bits, +1 for the match distance Huff code which is always 0
+					GUARANTEE_FLUSH();
+					EMIT_MATCH_3(adj_match_len);
 
 					src_ofs += match_len;
 				}
 				else
 				{
-					PUT_BITS_CZ(g_dyn_huff_3_codes[lits & 0xFF].m_code, g_dyn_huff_3_codes[lits & 0xFF].m_code_size);
-					PUT_BITS_CZ(g_dyn_huff_3_codes[(lits >> 8) & 0xFF].m_code, g_dyn_huff_3_codes[(lits >> 8) & 0xFF].m_code_size);
-					PUT_BITS_CZ(g_dyn_huff_3_codes[(lits >> 16)].m_code, g_dyn_huff_3_codes[(lits >> 16)].m_code_size);
+					GUARANTEE_FLUSH();
+					EMIT_RGB_LITERALS(lits);
 					
 					prev_lits = lits;
 
 					src_ofs += 3;
 				}
 
-				PUT_BITS_FLUSH;
-
 			} // while (src_ofs < end_src_ofs)
 
 		} // y
 
 		assert(src_ofs == h * bpl);
-		
-		assert(bit_buf_size <= 7);
 
-		PUT_BITS_CZ(g_dyn_huff_3_codes[256].m_code, g_dyn_huff_3_codes[256].m_code_size);
+		GUARANTEE_FLUSH();
+		EMIT_SYM_3(256);
 
-		PUT_BITS_FORCE_FLUSH;
+		// Flush leaves <= 7 bits, then the <= 12-bit EOB symbol is appended.
+		assert(bit_buf_size <= 19);
+		FINAL_FLUSH_3();
+
+#undef EMIT_RGB_LITERALS
+#undef EMIT_SYM_3
+#undef EMIT_MATCH_3
+#undef GUARANTEE_FLUSH
+#undef FINAL_FLUSH_3
 
 		// Write zlib adler32
 		for (uint32_t i = 0; i < 4; i++)
 		{
-			if ((dst_ofs + 1) > dst_buf_size)
+			if ((dst_ofs + 1) > legacy_capacity)
 				return 0;
 			*(uint8_t*)(pDst + dst_ofs) = (uint8_t)(src_adler32 >> 24);
 			dst_ofs++;
@@ -1448,8 +1570,10 @@ do { \
 
 	static uint32_t pixel_deflate_dyn_4_rle_one_pass(
 		const uint8_t* pImg, uint32_t w, uint32_t h,
-		uint8_t* pDst, uint32_t dst_buf_size)
+		uint8_t* pDst, uint32_t dst_buf_size, uint32_t legacy_capacity)
 	{
+		init_packed_huff_tables();
+
 		const uint32_t bpl = 1 + w * 4;
 
 		if (dst_buf_size < sizeof(g_dyn_huff_4))
@@ -1465,36 +1589,73 @@ do { \
 
 		uint32_t src_adler32 = fpng_adler32(pImg, bpl * h, FPNG_ADLER32_INIT);
 
+		const uint16_t* __restrict huff_code = g_huff_code_4;
+		const uint8_t* __restrict huff_size = g_huff_size_4;
+		const packed_match_sym* __restrict match_tbl = g_packed_match_4;
+
+#define EMIT_SYM_4(sym) do { \
+	bit_buf |= ((uint64_t)(huff_code[sym]) << bit_buf_size); \
+	bit_buf_size += huff_size[sym]; \
+} while(0)
+
+#define EMIT_MATCH_4(adj) do { \
+	const packed_match_sym& ms = match_tbl[adj]; \
+	bit_buf |= ((uint64_t)(ms.m_huff_code) << bit_buf_size); \
+	bit_buf_size += ms.m_huff_code_size; \
+	bit_buf |= ((uint64_t)(ms.m_extra_value) << bit_buf_size); \
+	bit_buf_size += ms.m_extra_bits; \
+} while(0)
+
+#define GUARANTEE_FLUSH_4() do { \
+	if ((dst_ofs + 8) > legacy_capacity) return 0; \
+	WRITE_LE64(pDst + dst_ofs, bit_buf); \
+	uint32_t bits_to_shift = bit_buf_size & ~7; \
+	dst_ofs += (bits_to_shift >> 3); \
+	bit_buf >>= bits_to_shift; \
+	bit_buf_size -= bits_to_shift; \
+} while(0)
+
+#define FINAL_FLUSH_4() do { \
+	while (bit_buf_size > 0) { \
+		pDst[dst_ofs++] = (uint8_t)bit_buf; \
+		bit_buf >>= 8; \
+		bit_buf_size -= 8; \
+	} \
+} while(0)
+
+		// Emit the four literal symbols of one RGBA pixel as one group. A
+		// preceding flush keeps at most 7 bits pending, so the 48-bit group can
+		// never overflow and no mid-pixel check is needed.
+#define EMIT_RGBA_LITERALS(lits) do { \
+	const uint32_t c0_ = (lits) & 0xFF, c1_ = ((lits) >> 8) & 0xFF, c2_ = ((lits) >> 16) & 0xFF, c3_ = (lits) >> 24; \
+	const uint32_t z0_ = huff_size[c0_], z1_ = huff_size[c1_], z2_ = huff_size[c2_]; \
+	const uint64_t combined4_ = (uint64_t)huff_code[c0_] \
+		| ((uint64_t)huff_code[c1_] << z0_) \
+		| ((uint64_t)huff_code[c2_] << (z0_ + z1_)) \
+		| ((uint64_t)huff_code[c3_] << (z0_ + z1_ + z2_)); \
+	bit_buf |= combined4_ << bit_buf_size; \
+	bit_buf_size += z0_ + z1_ + z2_ + huff_size[c3_]; \
+} while(0)
+
 		for (uint32_t y = 0; y < h; y++)
 		{
 			const uint32_t end_src_ofs = src_ofs + bpl;
 
 			const uint32_t filter_lit = pSrc[src_ofs++];
-			PUT_BITS_CZ(g_dyn_huff_4_codes[filter_lit].m_code, g_dyn_huff_4_codes[filter_lit].m_code_size);
-
-			PUT_BITS_FLUSH;
+			GUARANTEE_FLUSH_4();
+			EMIT_SYM_4(filter_lit);
 
 			uint32_t prev_lits;
 			{
 				uint32_t lits = READ_LE32(pSrc + src_ofs);
 
-				PUT_BITS_CZ(g_dyn_huff_4_codes[lits & 0xFF].m_code, g_dyn_huff_4_codes[lits & 0xFF].m_code_size);
-				PUT_BITS_CZ(g_dyn_huff_4_codes[(lits >> 8) & 0xFF].m_code, g_dyn_huff_4_codes[(lits >> 8) & 0xFF].m_code_size);
-				PUT_BITS_CZ(g_dyn_huff_4_codes[(lits >> 16) & 0xFF].m_code, g_dyn_huff_4_codes[(lits >> 16) & 0xFF].m_code_size);
-
-				if (bit_buf_size >= 49)
-				{
-					PUT_BITS_FLUSH;
-				}
-				
-				PUT_BITS_CZ(g_dyn_huff_4_codes[(lits >> 24)].m_code, g_dyn_huff_4_codes[(lits >> 24)].m_code_size);
+				GUARANTEE_FLUSH_4();
+				EMIT_RGBA_LITERALS(lits);
 
 				src_ofs += 4;
 				
 				prev_lits = lits;
 			}
-
-			PUT_BITS_FLUSH;
 
 			while (src_ofs < end_src_ofs)
 			{
@@ -1514,44 +1675,37 @@ do { \
 
 					uint32_t adj_match_len = match_len - 3;
 
-					const uint32_t match_code_bits = g_dyn_huff_4_codes[g_defl_len_sym[adj_match_len]].m_code_size;
-					const uint32_t len_extra_bits = g_defl_len_extra[adj_match_len];
-
 					if (match_len == 4)
 					{
 						// This check is optional - see if just encoding 4 literals would be cheaper than using a short match.
-						uint32_t lit_bits = g_dyn_huff_4_codes[lits & 0xFF].m_code_size + g_dyn_huff_4_codes[(lits >> 8) & 0xFF].m_code_size + 
-							g_dyn_huff_4_codes[(lits >> 16) & 0xFF].m_code_size + g_dyn_huff_4_codes[(lits >> 24)].m_code_size;
+						uint32_t lit_bits = huff_size[lits & 0xFF] + huff_size[(lits >> 8) & 0xFF] +
+							huff_size[(lits >> 16) & 0xFF] + huff_size[(lits >> 24)];
 						
-						if ((match_code_bits + len_extra_bits + 1) > lit_bits)
-							goto do_literals;
+						const packed_match_sym& ms = match_tbl[adj_match_len];
+						if ((ms.m_huff_code_size + ms.m_extra_bits) > lit_bits)
+						{
+							GUARANTEE_FLUSH_4();
+							EMIT_RGBA_LITERALS(lits);
+							src_ofs += 4;
+							prev_lits = lits;
+							continue;
+						}
 					}
 
-					PUT_BITS_CZ(g_dyn_huff_4_codes[g_defl_len_sym[adj_match_len]].m_code, match_code_bits);
-					PUT_BITS(adj_match_len & g_bitmasks[g_defl_len_extra[adj_match_len]], len_extra_bits + 1); // up to 6 bits, +1 for the match distance Huff code which is always 0
+					GUARANTEE_FLUSH_4();
+					EMIT_MATCH_4(adj_match_len);
 
 					src_ofs += match_len;
 				}
 				else
 				{
-do_literals:
-					PUT_BITS_CZ(g_dyn_huff_4_codes[lits & 0xFF].m_code, g_dyn_huff_4_codes[lits & 0xFF].m_code_size);
-					PUT_BITS_CZ(g_dyn_huff_4_codes[(lits >> 8) & 0xFF].m_code, g_dyn_huff_4_codes[(lits >> 8) & 0xFF].m_code_size);
-					PUT_BITS_CZ(g_dyn_huff_4_codes[(lits >> 16) & 0xFF].m_code, g_dyn_huff_4_codes[(lits >> 16) & 0xFF].m_code_size);
-
-					if (bit_buf_size >= 49)
-					{
-						PUT_BITS_FLUSH;
-					}
-
-					PUT_BITS_CZ(g_dyn_huff_4_codes[(lits >> 24)].m_code, g_dyn_huff_4_codes[(lits >> 24)].m_code_size);
+					GUARANTEE_FLUSH_4();
+					EMIT_RGBA_LITERALS(lits);
 
 					src_ofs += 4;
 					
 					prev_lits = lits;
 				}
-
-				PUT_BITS_FLUSH;
 
 			} // while (src_ofs < end_src_ofs)
 
@@ -1559,16 +1713,22 @@ do_literals:
 
 		assert(src_ofs == h * bpl);
 
-		assert(bit_buf_size <= 7);
+		GUARANTEE_FLUSH_4();
+		EMIT_SYM_4(256);
 
-		PUT_BITS_CZ(g_dyn_huff_4_codes[256].m_code, g_dyn_huff_4_codes[256].m_code_size);
+		assert(bit_buf_size <= 19);
+		FINAL_FLUSH_4();
 
-		PUT_BITS_FORCE_FLUSH;
+#undef EMIT_SYM_4
+#undef EMIT_MATCH_4
+#undef EMIT_RGBA_LITERALS
+#undef GUARANTEE_FLUSH_4
+#undef FINAL_FLUSH_4
 
 		// Write zlib adler32
 		for (uint32_t i = 0; i < 4; i++)
 		{
-			if ((dst_ofs + 1) > dst_buf_size)
+			if ((dst_ofs + 1) > legacy_capacity)
 				return 0;
 			*(uint8_t*)(pDst + dst_ofs) = (uint8_t)(src_adler32 >> 24);
 			dst_ofs++;
@@ -1702,7 +1862,26 @@ do_literals:
 				
 		uint32_t out_ofs = PNG_HEADER_SIZE;
 				
-		out_buf.resize((out_ofs + (bpl + 1) * h + 7) & ~7);
+		// Size for the worst case the bit packer can produce. Every literal
+		// uses at most a 12-bit Huffman code, so incompressible data expands to
+		// at most ceil(12/8) = 1.5 bytes per filtered input byte; on top of that
+		// come the precomputed dynamic-block prefix, the zlib header/adler and
+		// the PNG header already accounted for in out_ofs. The uncompressed
+		// fallback path (input plus one 5-byte header per 65535 bytes) is also
+		// bounded by this. A 16-byte tail margin (added after the size rounding)
+		// absorbs the packer's 8-byte wide stores without a per-pixel bounds
+		// check in the hot loop. The meaningful output is trimmed via resize().
+		const size_t filtered_size = (size_t)(bpl + 1) * h;
+		const size_t worst_defl_size = (filtered_size * 3) / 2 + 128;
+		out_buf.resize(((out_ofs + worst_defl_size + 7) & ~7) + 16);
+
+		// Capacity the original (pre-optimization) allocation provided to the
+		// deflate writer. The one-pass encoder reproduces its overflow decision
+		// against this limit so incompressible inputs still take the exact same
+		// uncompressed-block fallback and the output stays byte-for-byte
+		// identical, even though the real allocation now has headroom.
+		const uint32_t legacy_defl_capacity =
+			(uint32_t)(((out_ofs + filtered_size + 7) & ~7) - out_ofs);
 
 		uint32_t defl_size = 0;
 		if ((flags & FPNG_FORCE_UNCOMPRESSED) == 0)
@@ -1710,16 +1889,16 @@ do_literals:
 			if (num_chans == 3)
 			{
 				if (flags & FPNG_ENCODE_SLOWER)
-					defl_size = pixel_deflate_dyn_3_rle(temp_buf.data(), w, h, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs);
+					defl_size = pixel_deflate_dyn_3_rle(temp_buf.data(), w, h, &out_buf[out_ofs], legacy_defl_capacity);
 				else
-					defl_size = pixel_deflate_dyn_3_rle_one_pass(temp_buf.data(), w, h, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs);
+					defl_size = pixel_deflate_dyn_3_rle_one_pass(temp_buf.data(), w, h, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs, legacy_defl_capacity);
 			}
 			else
 			{
 				if (flags & FPNG_ENCODE_SLOWER)
-					defl_size = pixel_deflate_dyn_4_rle(temp_buf.data(), w, h, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs);
+					defl_size = pixel_deflate_dyn_4_rle(temp_buf.data(), w, h, &out_buf[out_ofs], legacy_defl_capacity);
 				else
-					defl_size = pixel_deflate_dyn_4_rle_one_pass(temp_buf.data(), w, h, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs);
+					defl_size = pixel_deflate_dyn_4_rle_one_pass(temp_buf.data(), w, h, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs, legacy_defl_capacity);
 			}
 		}
 
