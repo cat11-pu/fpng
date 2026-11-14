@@ -573,6 +573,12 @@ static bool fuzz_test_encoder(
 			int res = fpng::fpng_decode_memory(fpng_file_buf.data(), (uint32_t)fpng_file_buf.size(), fpngd_decode_buffer, decoded_width, decoded_height, channels_in_file, desired_chans);
 			if (res != 0)
 			{
+				// FPNG_ENCODE_SMALLEST files aren't decodable by fpng_decode_memory() by design; lodepng already validated them above.
+				if ((res == fpng::FPNG_DECODE_NOT_FPNG) && (fpng_flags & fpng::FPNG_ENCODE_SMALLEST))
+				{
+					free(lodepng_decoded_buffer);
+					continue;
+				}
 				fprintf(stderr, "fpng::fpng_decode() failed with error %i!\n", res);
 				return false;
 			}
@@ -661,6 +667,22 @@ static int fuzz_test_encoder2(uint32_t fpng_flags)
 		int res = fpng::fpng_decode_memory(fpng_file_buf.data(), (uint32_t)fpng_file_buf.size(), decomp_buf, dec_width, dec_height, dec_chans, num_chans);
 		if (res != fpng::FPNG_DECODE_SUCCESS)
 		{
+			// FPNG_ENCODE_SMALLEST files aren't decodable by fpng_decode_memory() by design - validate with lodepng instead.
+			if ((res == fpng::FPNG_DECODE_NOT_FPNG) && (fpng_flags & fpng::FPNG_ENCODE_SMALLEST))
+			{
+				unsigned char* pLodepng_buf = nullptr;
+				unsigned lodepng_w = 0, lodepng_h = 0;
+				unsigned lodepng_err = lodepng_decode_memory(&pLodepng_buf, &lodepng_w, &lodepng_h, (unsigned char*)fpng_file_buf.data(), fpng_file_buf.size(), (num_chans == 4) ? LCT_RGBA : LCT_RGB, 8);
+				if ((lodepng_err != 0) || (lodepng_w != width) || (lodepng_h != height) ||
+					(memcmp(pLodepng_buf, temp_buf.data(), (size_t)width * height * num_chans) != 0))
+				{
+					fprintf(stderr, "lodepng decode/verification of FPNG_ENCODE_SMALLEST file failed!\n");
+					free(pLodepng_buf);
+					return EXIT_FAILURE;
+				}
+				free(pLodepng_buf);
+				continue;
+			}
 			fprintf(stderr, "fpng::fpng_decode_memory() failed!\n");
 			return EXIT_FAILURE;
 		}
@@ -984,6 +1006,7 @@ int main(int arg_c, char **arg_v)
 		printf("\nOptions:\n");
 		printf("-s: 2 pass compression\n");
 		printf("-u: Use uncompressed Deflate blocks\n");
+		printf("-lX: Compression level: 0=fastest, 1=default, 2=smallest\n");
 		printf("-c: Write comma seperated values to stdout\n");
 		printf("-e: Fuzz encoder/decoder by randomly modifying an input image's pixels\n");
 		printf("-f: Decompress specified PNG image using FPNG, then exit\n");
@@ -1002,6 +1025,7 @@ int main(int arg_c, char **arg_v)
 	bool fuzz_decoder = false;
 	bool swizzle_green_to_alpha = false;
 	bool training_mode_flag = false;
+	int compression_level = -1;
 
 	for (int i = 1; i < arg_c; i++)
 	{
@@ -1040,6 +1064,15 @@ int main(int arg_c, char **arg_v)
 			{
 				training_mode_flag = true;
 			}
+			else if (pArg[1] == 'l')
+			{
+				if ((pArg[2] < '0') || (pArg[2] > '2') || (pArg[3] != '\0'))
+				{
+					fprintf(stderr, "Invalid compression level: %s (expected -l0, -l1 or -l2)\n", pArg);
+					return EXIT_FAILURE;
+				}
+				compression_level = pArg[2] - '0';
+			}
 			else
 			{
 				fprintf(stderr, "Unrecognized option: %s\n", pArg);
@@ -1066,6 +1099,8 @@ int main(int arg_c, char **arg_v)
 		fpng_flags |= fpng::FPNG_ENCODE_SLOWER;
 	if (force_uncompressed)
 		fpng_flags |= fpng::FPNG_FORCE_UNCOMPRESSED;
+	if (compression_level >= 0)
+		fpng_flags = fpng::fpng_level_to_flags((uint32_t)compression_level);
 
 	if (fuzz_encoder2)
 		return fuzz_test_encoder2(fpng_flags);
@@ -1233,6 +1268,11 @@ int main(int arg_c, char **arg_v)
 	
 	double fpng_decode_time = 0.0f, lodepng_decode_time = 0.0f, stbi_decode_time = 0.0f, qoi_decode_time = 0.0f, wuffs_decode_time = 0.0f, pvpng_decode_time = 0.0f;
 
+	// Files encoded with FPNG_ENCODE_SMALLEST intentionally use general purpose Deflate streams that
+	// fpng_decode_memory() doesn't support - it returns FPNG_DECODE_NOT_FPNG so callers fall back to
+	// a general purpose PNG decoder (which is thoroughly validated below).
+	bool fpng_can_decode = true;
+
 	// Decode the file using our decompressor
 	{
 		std::vector<uint8_t> fpngd_decode_buffer;
@@ -1255,17 +1295,26 @@ int main(int arg_c, char **arg_v)
 
 		if (res != 0)
 		{
+			if ((res == fpng::FPNG_DECODE_NOT_FPNG) && (fpng_flags & fpng::FPNG_ENCODE_SMALLEST))
+			{
+				fpng_can_decode = false;
+				fpng_decode_time = 0.0f;
+				printf("Note: fpng_decode_memory() returned FPNG_DECODE_NOT_FPNG as expected for FPNG_ENCODE_SMALLEST, using general purpose decoders for validation\n");
+			}
+			else
+			{
 			fprintf(stderr, "fpng::fpng_decode() failed with error %i!\n", res);
 			return EXIT_FAILURE;
+			}
 		}
 
-		if ((decoded_width != source_width) || (decoded_height != source_height))
+		if (fpng_can_decode && ((decoded_width != source_width) || (decoded_height != source_height)))
 		{
 			fprintf(stderr, "fpng::fpng_decode() returned an invalid image\n");
 			return EXIT_FAILURE;
 		}
 
-		if (memcmp(fpngd_decode_buffer.data(), pSource_pixels32, total_source_pixels * 4) != 0)
+		if (fpng_can_decode && (memcmp(fpngd_decode_buffer.data(), pSource_pixels32, total_source_pixels * 4) != 0))
 		{
 			fprintf(stderr, "FPNG decode verification failed (using FPNG)!\n");
 			return EXIT_FAILURE;
@@ -1273,7 +1322,7 @@ int main(int arg_c, char **arg_v)
 	}
 
 	// Test 4->3 conversion in FPNG decoder
-	if (source_chans == 4)
+	if (fpng_can_decode && (source_chans == 4))
 	{
 		std::vector<uint8_t> fpngd_decode_buffer2;
 		uint32_t channels_in_file2;
@@ -1300,7 +1349,7 @@ int main(int arg_c, char **arg_v)
 	}
 
 	// Test 3->4 conversion in FPNG decoder
-	if (source_chans == 3)
+	if (fpng_can_decode && (source_chans == 3))
 	{
 		std::vector<uint8_t> fpngd_decode_buffer2;
 		uint32_t channels_in_file2;
@@ -1608,7 +1657,10 @@ int main(int arg_c, char **arg_v)
 	if (!csv_flag)
 	{
 		printf("** Decoding:\n");
-		printf("FPNG:    %3.6f secs, %4.3f MP/sec\n", fpng_decode_time, (total_source_pixels / (1024.0f * 1024.0f)) / fpng_decode_time);
+		if (fpng_can_decode)
+			printf("FPNG:    %3.6f secs, %4.3f MP/sec\n", fpng_decode_time, (total_source_pixels / (1024.0f * 1024.0f)) / fpng_decode_time);
+		else
+			printf("FPNG:    N/A (file requires a general purpose PNG decoder)\n");
 		printf("lodepng: %3.6f secs, %4.3f MP/sec\n", lodepng_decode_time, (total_source_pixels / (1024.0f * 1024.0f)) / lodepng_decode_time);
 		printf("stbi:    %3.6f secs, %4.3f MP/sec\n", stbi_decode_time, (total_source_pixels / (1024.0f * 1024.0f)) / stbi_decode_time);
 		printf("wuffs:   %3.6f secs, %4.3f MP/sec\n", wuffs_decode_time, (total_source_pixels / (1024.0f * 1024.0f)) / wuffs_decode_time);
@@ -1625,7 +1677,7 @@ int main(int arg_c, char **arg_v)
 		printf("%s, %u, %u, %u,    %f, %f, %f, %4.3f, %4.3f,    %f, %f, %f, %4.3f, %4.3f,    %f, %f, %f, %4.3f, %4.3f,    %f, %f, %f, %4.3f, %4.3f,   %4.3f, %4.3f\n",
 			pFilename, source_width, source_height, source_chans,
 			qoi_best_time, (double)qoi_len / MB, qoi_decode_time, source_megapixels / qoi_best_time, source_megapixels / qoi_decode_time,
-			fpng_best_time, (double)fpng_file_buf.size() / MB, fpng_decode_time, source_megapixels / fpng_best_time, source_megapixels / fpng_decode_time,
+			fpng_best_time, (double)fpng_file_buf.size() / MB, fpng_decode_time, source_megapixels / fpng_best_time, fpng_can_decode ? (source_megapixels / fpng_decode_time) : 0.0,
 			lodepng_best_time, (double)lodepng_file_buf.size() / MB, lodepng_decode_time, source_megapixels / lodepng_best_time, source_megapixels / lodepng_decode_time,
 			stbi_best_time, (double)stbi_file_buf.size() / MB, stbi_decode_time, source_megapixels / stbi_best_time, source_megapixels / stbi_decode_time,
 			pvpng_decode_time, source_megapixels / pvpng_decode_time
@@ -1637,4 +1689,3 @@ int main(int arg_c, char **arg_v)
 
 	return EXIT_SUCCESS;
 }
-

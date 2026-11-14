@@ -103,6 +103,25 @@ namespace fpng {
 
 `num_chans` must be 3 or 4. There must be ```w*3*h``` or ```w*4*h``` bytes pointed to by ```pImage```. The image row pitch is always ```w*3``` or ```w*4``` bytes. There is no automatic determination if the image actually uses an alpha channel, so if you call it with 4 you will always get a 32bpp .PNG file.
 
+### Compression levels
+
+Three preset compression levels are available, trading encoding speed against output size. All three produce standard PNG files that any standards-compliant PNG decoder (libpng, lodepng, stb_image, wuffs, etc.) can decode to pixel-identical pixels:
+
+| Level | Flags value | Tradeoff |
+|---|---|---|
+| `FPNG_LEVEL_FASTEST` | `FPNG_FORCE_UNCOMPRESSED` | Fastest (raw Deflate blocks), largest files |
+| `FPNG_LEVEL_DEFAULT` | `0` | Balanced single-pass encoder |
+| `FPNG_LEVEL_SMALLEST` | `FPNG_ENCODE_SMALLEST` | Slowest, ~10%+ smaller than default |
+
+Pass the level through `fpng_level_to_flags()` to get the flags for the encode functions:
+
+```
+std::vector<uint8_t> out;
+fpng::fpng_encode_image_to_memory(pPixels, w, h, 4, out, fpng::fpng_level_to_flags(fpng::FPNG_LEVEL_SMALLEST));
+```
+
+`FPNG_LEVEL_SMALLEST` evaluates all 5 PNG filter types per scanline and compresses with a general purpose LZ77 Deflate encoder (256 byte window, lazy matching) using per-file dynamic Huffman tables. Files written at this level cannot be decoded by `fpng_decode_memory()` (it returns `FPNG_DECODE_NOT_FPNG`), so decode them with a general purpose PNG decoder.
+
 ### Decoding
 
 Reliably/safely/robustly parsing binary image files in C/C++ is very difficult, so use the included example decoder at your own risk. I've fuzzed it and double and triple checked everything, but it's always possible I've made a mistake. I highly recommend you use [Wuffs](https://github.com/google/wuffs) to decode .PNG's created by this module. Its decoder is extremely fast and robust. Anyhow:

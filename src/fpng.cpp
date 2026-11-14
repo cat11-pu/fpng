@@ -1579,6 +1579,241 @@ do_literals:
 		return dst_ofs;
 	}
 
+	// Distance symbol base values/extra bit counts for Deflate distance symbols 0-15 (distances 1-256).
+	static const uint16_t g_defl_small_dist_base[16] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193 };
+	static const uint8_t g_defl_small_dist_extra[16] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6 };
+
+	// General purpose LZ77 Deflate encoder with a 256 byte window, lazy matching, and per-file dynamic Huffman tables.
+	// Used by the FPNG_ENCODE_SMALLEST level. Compresses the filtered scanline buffer (filter bytes included) as a
+	// plain byte stream, so it's independent of the image's channel count. The small window keeps distance codes
+	// cheap (1-6 extra bits), which is a win on typical PNG filter residuals. Returns 0 on output buffer overflow.
+	static uint32_t pixel_deflate_dyn_small(const uint8_t* pSrc, uint32_t src_len, uint8_t* pDst, uint32_t dst_buf_size)
+	{
+		const uint32_t FPNG_SMALL_WINDOW = 256;
+		const uint32_t FPNG_SMALL_HASH_BITS = 15;
+		const uint32_t FPNG_SMALL_HASH_SIZE = 1 << FPNG_SMALL_HASH_BITS;
+		const uint32_t FPNG_SMALL_MAX_PROBES = 256;
+
+		std::vector<int32_t> head(FPNG_SMALL_HASH_SIZE, -1);
+		std::vector<int32_t> prev(FPNG_SMALL_WINDOW, -1);
+
+		// Literal codes are 0-255. Match codes set the high bit and pack (len-3) and (dist-1) into 8 bits each.
+		std::vector<uint32_t> codes((size_t)src_len + 1);
+		uint32_t total_codes = 0;
+
+		uint32_t lit_freq[DEFL_MAX_HUFF_SYMBOLS_0];
+		memset(lit_freq, 0, sizeof(lit_freq));
+
+		uint32_t dist_freq[DEFL_MAX_HUFF_SYMBOLS_1];
+		memset(dist_freq, 0, sizeof(dist_freq));
+
+#define FPNG_SMALL_HASH(ofs) (((uint32_t)pSrc[ofs] | ((uint32_t)pSrc[(ofs) + 1] << 8) | ((uint32_t)pSrc[(ofs) + 2] << 16)) * 0x9E3779B1u >> (32 - FPNG_SMALL_HASH_BITS))
+
+#define FPNG_SMALL_INSERT(ofs) \
+		do { \
+			const uint32_t h_ = FPNG_SMALL_HASH(ofs); \
+			prev[(ofs) & (FPNG_SMALL_WINDOW - 1)] = head[h_]; \
+			head[h_] = (int32_t)(ofs); \
+		} while (0)
+
+#define FPNG_SMALL_EMIT_LIT(lit) \
+		do { \
+			codes[total_codes++] = (lit); \
+			lit_freq[lit]++; \
+		} while (0)
+
+#define FPNG_SMALL_EMIT_MATCH(len, dist) \
+		do { \
+			codes[total_codes++] = 0x80000000u | (((len) - 3) << 8) | ((dist) - 1); \
+			lit_freq[g_defl_len_sym[(len) - 3]]++; \
+			dist_freq[g_defl_small_dist_sym[(dist) - 1]]++; \
+		} while (0)
+
+		uint32_t pos = 0;
+		uint32_t pend_len = 0, pend_dist = 0; // pending (held back) match starting at pos-1, for lazy matching
+
+		while (pos < src_len)
+		{
+			uint32_t best_len = 0, best_dist = 0;
+
+			if (pos + DEFL_MIN_MATCH_LEN <= src_len)
+			{
+				const uint32_t h = FPNG_SMALL_HASH(pos);
+				int32_t cand = head[h];
+				prev[pos & (FPNG_SMALL_WINDOW - 1)] = cand;
+				head[h] = (int32_t)pos;
+
+				const uint32_t max_len = minimum<uint32_t>(DEFL_MAX_MATCH_LEN, src_len - pos);
+				uint32_t probes = FPNG_SMALL_MAX_PROBES;
+
+				while ((cand >= 0) && ((pos - (uint32_t)cand) <= FPNG_SMALL_WINDOW) && probes--)
+				{
+					const uint8_t* pCand = pSrc + cand;
+
+					if ((!best_len) || (pCand[best_len] == pSrc[pos + best_len]))
+					{
+						uint32_t len = 0;
+						while ((len < max_len) && (pCand[len] == pSrc[pos + len]))
+							len++;
+
+						if (len > best_len)
+						{
+							best_len = len;
+							best_dist = pos - (uint32_t)cand;
+							if (len >= max_len)
+								break;
+						}
+					}
+
+					cand = prev[cand & (FPNG_SMALL_WINDOW - 1)];
+				}
+
+				if (best_len < DEFL_MIN_MATCH_LEN)
+					best_len = 0;
+			}
+
+			if (pend_len)
+			{
+				if (best_len > pend_len)
+				{
+					// The match starting at pos beats the pending match at pos-1: emit pos-1 as a literal.
+					FPNG_SMALL_EMIT_LIT(pSrc[pos - 1]);
+					pend_len = best_len;
+					pend_dist = best_dist;
+					pos++;
+				}
+				else
+				{
+					// Emit the pending match at pos-1 and insert the match's remaining positions into the hash chains.
+					FPNG_SMALL_EMIT_MATCH(pend_len, pend_dist);
+
+					const uint32_t match_end = (pos - 1) + pend_len;
+					for (uint32_t p = pos + 1; p < match_end; p++)
+					{
+						if (p + DEFL_MIN_MATCH_LEN <= src_len)
+							FPNG_SMALL_INSERT(p);
+					}
+
+					pos = match_end;
+					pend_len = 0;
+				}
+			}
+			else if (best_len)
+			{
+				// Hold this match back and see if a better one starts at the next position.
+				pend_len = best_len;
+				pend_dist = best_dist;
+				pos++;
+			}
+			else
+			{
+				FPNG_SMALL_EMIT_LIT(pSrc[pos]);
+				pos++;
+			}
+		}
+
+		if (pend_len)
+			FPNG_SMALL_EMIT_MATCH(pend_len, pend_dist);
+
+#undef FPNG_SMALL_HASH
+#undef FPNG_SMALL_INSERT
+#undef FPNG_SMALL_EMIT_LIT
+#undef FPNG_SMALL_EMIT_MATCH
+
+		// Ensure at least 2 distance symbols are present: some inflaters reject distance tables with 0 or 1 codes.
+		{
+			uint32_t num_dist_syms = 0;
+			for (uint32_t i = 0; i < 30; i++)
+				if (dist_freq[i])
+					num_dist_syms++;
+
+			if (num_dist_syms == 0)
+			{
+				dist_freq[0] = 1;
+				dist_freq[1] = 1;
+			}
+			else if (num_dist_syms == 1)
+			{
+				if (!dist_freq[0])
+					dist_freq[0] = 1;
+				else
+					dist_freq[1] = 1;
+			}
+		}
+
+		defl_huff dh;
+		memset(&dh, 0, sizeof(dh));
+
+		lit_freq[256] = 1; // end of block
+
+		adjust_freq32(DEFL_MAX_HUFF_SYMBOLS_0, lit_freq, &dh.m_huff_count[0][0]);
+		adjust_freq32(DEFL_MAX_HUFF_SYMBOLS_1, dist_freq, &dh.m_huff_count[1][0]);
+
+		uint64_t bit_buf = 0;
+		int bit_buf_size = 0;
+		uint32_t dst_ofs = 0;
+
+		// zlib header
+		PUT_BITS(0x78, 8);
+		PUT_BITS(0x01, 8);
+
+		// write BFINAL bit
+		PUT_BITS(1, 1);
+
+		if (!defl_start_dynamic_block(&dh, pDst, dst_ofs, dst_buf_size, bit_buf, bit_buf_size))
+			return 0;
+
+		for (uint32_t i = 0; i < total_codes; i++)
+		{
+			const uint32_t c = codes[i];
+
+			if (c < 256)
+			{
+				PUT_BITS_CZ(dh.m_huff_codes[0][c], dh.m_huff_code_sizes[0][c]);
+			}
+			else
+			{
+				const uint32_t match_len = ((c >> 8) & 0xFF) + 3;
+				const uint32_t match_dist = (c & 0xFF) + 1;
+
+				const uint32_t len_sym = g_defl_len_sym[match_len - 3];
+				PUT_BITS_CZ(dh.m_huff_codes[0][len_sym], dh.m_huff_code_sizes[0][len_sym]);
+
+				const uint32_t len_extra = g_defl_len_extra[match_len - 3];
+				if (len_extra)
+					PUT_BITS((match_len - 3) & g_bitmasks[len_extra], len_extra);
+
+				const uint32_t dist_sym = g_defl_small_dist_sym[match_dist - 1];
+				PUT_BITS_CZ(dh.m_huff_codes[1][dist_sym], dh.m_huff_code_sizes[1][dist_sym]);
+
+				const uint32_t dist_extra = g_defl_small_dist_extra[dist_sym];
+				if (dist_extra)
+					PUT_BITS(match_dist - g_defl_small_dist_base[dist_sym], dist_extra);
+			}
+
+			// up to 35 bits per match
+			PUT_BITS_FLUSH;
+		}
+
+		PUT_BITS_CZ(dh.m_huff_codes[0][256], dh.m_huff_code_sizes[0][256]);
+
+		PUT_BITS_FORCE_FLUSH;
+
+		// Write zlib adler32
+		uint32_t src_adler32 = fpng_adler32(pSrc, src_len, FPNG_ADLER32_INIT);
+		for (uint32_t i = 0; i < 4; i++)
+		{
+			if ((dst_ofs + 1) > dst_buf_size)
+				return 0;
+			*(uint8_t*)(pDst + dst_ofs) = (uint8_t)(src_adler32 >> 24);
+			dst_ofs++;
+
+			src_adler32 <<= 8;
+		}
+
+		return dst_ofs;
+	}
+
 	static void vector_append(std::vector<uint8_t>& buf, const void* pData, size_t len)
 	{
 		if (len)
@@ -1600,6 +1835,18 @@ do_literals:
 			*pDst++ = 0;
 
 			memcpy(pDst, pSrc, bpl);
+			break;
+		}
+		case 1:
+		{
+			// Sub
+			*pDst++ = 1;
+
+			for (uint32_t i = 0; i < (uint32_t)bpl; i++)
+			{
+				const uint8_t a = (i >= num_chans) ? pSrc[i - num_chans] : 0;
+				pDst[i] = (uint8_t)(pSrc[i] - a);
+			}
 			break;
 		}
 		case 2:
@@ -1653,9 +1900,85 @@ do_literals:
 
 			break;
 		}
+		case 3:
+		{
+			// Average
+			assert(pPrev_src);
+
+			*pDst++ = 3;
+
+			for (uint32_t i = 0; i < (uint32_t)bpl; i++)
+			{
+				const uint32_t a = (i >= num_chans) ? pSrc[i - num_chans] : 0;
+				const uint32_t b = pPrev_src[i];
+				pDst[i] = (uint8_t)(pSrc[i] - ((a + b) >> 1));
+			}
+			break;
+		}
+		case 4:
+		{
+			// Paeth
+			assert(pPrev_src);
+
+			*pDst++ = 4;
+
+			for (uint32_t i = 0; i < (uint32_t)bpl; i++)
+			{
+				const int a = (i >= num_chans) ? pSrc[i - num_chans] : 0;
+				const int b = pPrev_src[i];
+				const int c = (i >= num_chans) ? pPrev_src[i - num_chans] : 0;
+
+				const int p = a + b - c;
+				const int pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
+				const int pr = ((pa <= pb) && (pa <= pc)) ? a : ((pb <= pc) ? b : c);
+
+				pDst[i] = (uint8_t)(pSrc[i] - pr);
+			}
+			break;
+		}
 		default:
 			assert(0);
 			break;
+		}
+	}
+
+	// Tries all 5 PNG filter types on a scanline and copies the one with the lowest sum of absolute
+	// (signed) residual byte values to pDst. pTmp must point to at least bpl+1 bytes of scratch space.
+	// pPrev_src must point to the previous scanline (or a zeroed buffer for the first scanline).
+	static void apply_filter_best(int w, uint32_t num_chans, uint32_t bpl, const uint8_t* pSrc, const uint8_t* pPrev_src, uint8_t* pDst, uint8_t* pTmp)
+	{
+		uint64_t best_score = UINT64_MAX;
+
+		for (uint32_t filter = 0; filter < 5; filter++)
+		{
+			apply_filter(filter, w, 1, num_chans, bpl, pSrc, pPrev_src, pTmp);
+
+			uint64_t score = 0;
+			for (uint32_t i = 1; i <= bpl; i++)
+			{
+				const int v = (int)(int8_t)pTmp[i];
+				score += (uint32_t)abs(v);
+			}
+
+			if (score < best_score)
+			{
+				best_score = score;
+				memcpy(pDst, pTmp, bpl + 1);
+			}
+		}
+	}
+
+	uint32_t fpng_level_to_flags(uint32_t level)
+	{
+		switch (level)
+		{
+		case FPNG_LEVEL_FASTEST:
+			return FPNG_FORCE_UNCOMPRESSED;
+		case FPNG_LEVEL_SMALLEST:
+			return FPNG_ENCODE_SMALLEST;
+		case FPNG_LEVEL_DEFAULT:
+		default:
+			return 0;
 		}
 	}
 
@@ -1686,16 +2009,37 @@ do_literals:
 		temp_buf.resize((bpl + 1) * h + 7);
 		uint32_t temp_buf_ofs = 0;
 
-		for (y = 0; y < h; ++y)
+		if (flags & FPNG_ENCODE_SMALLEST)
 		{
-			const uint8_t* pSrc = (uint8_t*)pImage + y * bpl;
-			const uint8_t* pPrev_src = y ? ((uint8_t*)pImage + (y - 1) * bpl) : nullptr;
+			// Maximum compression: evaluate all 5 PNG filter types on each scanline and keep the best one.
+			std::vector<uint8_t> filter_tmp_buf(bpl + 1);
+			std::vector<uint8_t> zero_row_buf(bpl);
 
-			uint8_t* pDst = &temp_buf[temp_buf_ofs];
+			for (y = 0; y < h; ++y)
+			{
+				const uint8_t* pSrc = (uint8_t*)pImage + y * bpl;
+				const uint8_t* pPrev_src = y ? ((uint8_t*)pImage + (y - 1) * bpl) : zero_row_buf.data();
 
-			apply_filter(y ? 2 : 0, w, h, num_chans, bpl, pSrc, pPrev_src, pDst);
+				uint8_t* pDst = &temp_buf[temp_buf_ofs];
 
-			temp_buf_ofs += 1 + bpl;
+				apply_filter_best(w, num_chans, bpl, pSrc, pPrev_src, pDst, filter_tmp_buf.data());
+
+				temp_buf_ofs += 1 + bpl;
+			}
+		}
+		else
+		{
+			for (y = 0; y < h; ++y)
+			{
+				const uint8_t* pSrc = (uint8_t*)pImage + y * bpl;
+				const uint8_t* pPrev_src = y ? ((uint8_t*)pImage + (y - 1) * bpl) : nullptr;
+
+				uint8_t* pDst = &temp_buf[temp_buf_ofs];
+
+				apply_filter(y ? 2 : 0, w, h, num_chans, bpl, pSrc, pPrev_src, pDst);
+
+				temp_buf_ofs += 1 + bpl;
+			}
 		}
 
 		const uint32_t PNG_HEADER_SIZE = 58;
@@ -1707,7 +2051,14 @@ do_literals:
 		uint32_t defl_size = 0;
 		if ((flags & FPNG_FORCE_UNCOMPRESSED) == 0)
 		{
-			if (num_chans == 3)
+			if (flags & FPNG_ENCODE_SMALLEST)
+			{
+				// Worst case output is a dynamic block header plus up to 12 bits per literal.
+				out_buf.resize((size_t)out_ofs + (size_t)temp_buf_ofs + temp_buf_ofs / 2 + 1024);
+
+				defl_size = pixel_deflate_dyn_small(temp_buf.data(), temp_buf_ofs, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs);
+			}
+			else if (num_chans == 3)
 			{
 				if (flags & FPNG_ENCODE_SLOWER)
 					defl_size = pixel_deflate_dyn_3_rle(temp_buf.data(), w, h, &out_buf[out_ofs], (uint32_t)out_buf.size() - out_ofs);

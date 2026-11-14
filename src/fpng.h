@@ -39,9 +39,34 @@ namespace fpng
 		
 		// Only use raw Deflate blocks (no compression at all). Intended for testing.
 		FPNG_FORCE_UNCOMPRESSED = 2,
+
+		// Maximum compression: per-row optimal PNG filtering (all 5 filter types) combined with a general purpose
+		// LZ77 Deflate encoder (256 byte window, lazy matching) and per-file dynamic Huffman tables.
+		// Results in roughly 10%+ smaller files vs. the default encoder, but compression is significantly slower.
+		// Note: files written with this flag are NOT decodable by fpng_decode_memory() (it will return
+		// FPNG_DECODE_NOT_FPNG), so decode them with a general purpose PNG decoder (lodepng, stb_image, libpng, etc.).
+		FPNG_ENCODE_SMALLEST = 4,
 	};
 
+	// ---- Preset compression levels, for callers who prefer a simple 3-way speed/ratio tradeoff.
+	enum
+	{
+		// Fastest encoding (raw Deflate blocks), largest files.
+		FPNG_LEVEL_FASTEST = 0,
+
+		// Default single-pass encoder: balanced speed/ratio.
+		FPNG_LEVEL_DEFAULT = 1,
+
+		// Slowest encoding, smallest files.
+		FPNG_LEVEL_SMALLEST = 2
+	};
+
+	// Maps a FPNG_LEVEL_* preset to the equivalent fpng_encode_image_to_memory()/fpng_encode_image_to_file() flags.
+	// Unknown levels map to the default (0 flags).
+	uint32_t fpng_level_to_flags(uint32_t level);
+
 	// Fast PNG encoding. The resulting file can be decoded either using a standard PNG decoder or by the fpng_decode_memory() function below.
+	// (Exception: files encoded with FPNG_ENCODE_SMALLEST must be decoded with a standard PNG decoder.)
 	// pImage: pointer to RGB or RGBA image pixels, R first in memory, B/A last.
 	// w/h - image dimensions. Image's row pitch in bytes must is w*num_chans.
 	// num_chans must be 3 or 4. 

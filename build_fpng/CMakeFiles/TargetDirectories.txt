@@ -1,0 +1,7 @@
+/home/cat/gsb/uid3681/build_fpng/CMakeFiles/fpng_test.dir
+/home/cat/gsb/uid3681/build_fpng/CMakeFiles/edit_cache.dir
+/home/cat/gsb/uid3681/build_fpng/CMakeFiles/rebuild_cache.dir
+/home/cat/gsb/uid3681/build_fpng/CMakeFiles/list_install_components.dir
+/home/cat/gsb/uid3681/build_fpng/CMakeFiles/install.dir
+/home/cat/gsb/uid3681/build_fpng/CMakeFiles/install/local.dir
+/home/cat/gsb/uid3681/build_fpng/CMakeFiles/install/strip.dir
