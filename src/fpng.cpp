@@ -1667,7 +1667,7 @@ do_literals:
 			return false;
 		}
 
-		if ((w < 1) || (h < 1) || (w * (uint64_t)h > UINT32_MAX) || (w > FPNG_MAX_SUPPORTED_DIM) || (h > FPNG_MAX_SUPPORTED_DIM))
+		if ((w < 1) || (h < 1) || (w > FPNG_MAX_SUPPORTED_DIM) || (h > FPNG_MAX_SUPPORTED_DIM))
 		{
 			assert(0);
 			return false;
@@ -1679,11 +1679,26 @@ do_literals:
 			return false;
 		}
 
-		int i, bpl = w * num_chans;
+		// Every byte offset/size used by the encoder and the PNG/IDAT framing is tracked
+		// in uint32_t, and a single PNG IDAT chunk's length field is also 32-bit, so the
+		// whole filtered raster (1 filter byte + w*num_chans bytes per scanline) must fit
+		// in 32 bits. The previous check only validated w*h (the pixel count), which let
+		// tall, narrow images wrap the (bpl+1)*h products below and undersize every
+		// destination buffer, causing out-of-bounds writes.
+		const uint64_t bpl64 = (uint64_t)w * num_chans;
+		const uint64_t filtered_size64 = (bpl64 + 1) * (uint64_t)h;
+		if (filtered_size64 > UINT32_MAX)
+		{
+			assert(0);
+			return false;
+		}
+
+		int i, bpl = (int)bpl64;
+		const uint32_t filtered_size = (uint32_t)filtered_size64;
 		uint32_t y;
 
 		std::vector<uint8_t> temp_buf;
-		temp_buf.resize((bpl + 1) * h + 7);
+		temp_buf.resize((size_t)filtered_size + 7);
 		uint32_t temp_buf_ofs = 0;
 
 		for (y = 0; y < h; ++y)
@@ -1702,7 +1717,7 @@ do_literals:
 				
 		uint32_t out_ofs = PNG_HEADER_SIZE;
 				
-		out_buf.resize((out_ofs + (bpl + 1) * h + 7) & ~7);
+		out_buf.resize(((uint64_t)out_ofs + filtered_size + 7) & ~7ULL);
 
 		uint32_t defl_size = 0;
 		if ((flags & FPNG_FORCE_UNCOMPRESSED) == 0)
@@ -1744,7 +1759,7 @@ do_literals:
 
 			assert(temp_buf_ofs <= temp_buf.size());
 						
-			out_buf.resize(out_ofs + 6 + temp_buf_ofs + ((temp_buf_ofs + 65534) / 65535) * 5);
+			out_buf.resize((size_t)out_ofs + 6 + temp_buf_ofs + ((temp_buf_ofs + 65534u) / 65535u) * 5u);
 
 			uint32_t raw_size = write_raw_block(temp_buf.data(), (uint32_t)temp_buf_ofs, out_buf.data() + out_ofs, (uint32_t)out_buf.size() - out_ofs);
 			if (!raw_size)
@@ -1770,8 +1785,8 @@ do_literals:
 			uint8_t pnghdr[58] = { 
 				0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,   // PNG sig
 				0x00,0x00,0x00,0x0d, 'I','H','D','R',  // IHDR chunk len, type
-			    0,0,(uint8_t)(w >> 8),(uint8_t)w, // width
-				0,0,(uint8_t)(h >> 8),(uint8_t)h, // height
+			    (uint8_t)(w >> 24),(uint8_t)(w >> 16),(uint8_t)(w >> 8),(uint8_t)w, // width (full 32-bit BE)
+				(uint8_t)(h >> 24),(uint8_t)(h >> 16),(uint8_t)(h >> 8),(uint8_t)h, // height (full 32-bit BE)
 				8,   //bit_depth
 				s_color_type[num_chans], // color_type
 				0, // compression
