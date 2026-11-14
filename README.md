@@ -80,6 +80,10 @@ There will be several output files written to the current directory: stbi.png, l
 
 The test app decompresses fpng's output using lodepng, stb_image, and the fpng decoder to validate the compressed data. The compressed output has also been validated using [pngcheck](http://www.libpng.org/pub/png/apps/pngcheck.html).
 
+For the deterministic 2000-image round-trip/determinism suite and the
+extreme-dimension cases, run `./tests/run_validation.sh`. See
+`tests/README.md` for the corpus definition and output manifests.
+
 ## Using fpng 
 
 To use fpng.cpp in other programs, copy fpng.cpp/.h into your project. Alternatively, `#include "fpng.cpp"` and `#include "fpng.h"` in one place, and then `#include "fpng.h"` everywhere else. 

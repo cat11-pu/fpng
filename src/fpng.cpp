@@ -1770,8 +1770,8 @@ do_literals:
 			uint8_t pnghdr[58] = { 
 				0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,   // PNG sig
 				0x00,0x00,0x00,0x0d, 'I','H','D','R',  // IHDR chunk len, type
-			    0,0,(uint8_t)(w >> 8),(uint8_t)w, // width
-				0,0,(uint8_t)(h >> 8),(uint8_t)h, // height
+			    (uint8_t)(w >> 24),(uint8_t)(w >> 16),(uint8_t)(w >> 8),(uint8_t)w, // width
+				(uint8_t)(h >> 24),(uint8_t)(h >> 16),(uint8_t)(h >> 8),(uint8_t)h, // height
 				8,   //bit_depth
 				s_color_type[num_chans], // color_type
 				0, // compression
